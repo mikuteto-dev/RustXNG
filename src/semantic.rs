@@ -5,7 +5,8 @@ mod platform {
     use std::fs::File;
     use std::panic::AssertUnwindSafe;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use half::f16;
     use hf_hub::api::sync::Api;
@@ -34,10 +35,12 @@ mod platform {
     const HIDDEN: usize = 512;
     const DIMENSIONS: usize = 768;
     const VOCABULARY: usize = 262_144;
+    const PACK_LENGTH: usize = 256;
+    const PACK_SLOTS: usize = 8;
 
     struct LoadedModel(Retained<MLModel>);
 
-    // Core ML documents prediction as thread-safe. Access is additionally serialized by `models`.
+    // Core ML documents prediction as thread-safe. Access is additionally serialized by model mutexes.
     unsafe impl Send for LoadedModel {}
 
     pub struct EmbeddingGemma2 {
@@ -47,6 +50,8 @@ mod platform {
         pad_id: u32,
         compiled: PathBuf,
         models: Mutex<BTreeMap<usize, LoadedModel>>,
+        pack: Arc<Mutex<Option<LoadedModel>>>,
+        pack_started: AtomicBool,
     }
 
     impl EmbeddingGemma2 {
@@ -115,6 +120,8 @@ mod platform {
                 pad_id,
                 compiled,
                 models: Mutex::new(BTreeMap::new()),
+                pack: Arc::new(Mutex::new(None)),
+                pack_started: AtomicBool::new(false),
             })
         }
 
@@ -131,7 +138,39 @@ mod platform {
                         .map_err(|error| error.to_string())
                 })
                 .collect::<Result<_, _>>()?;
-            let longest = ids.iter().map(Vec::len).max().unwrap_or(0);
+            let (bins, mut singles) = plan_packs(&ids.iter().map(Vec::len).collect::<Vec<_>>());
+            let mut output = vec![None; ids.len()];
+            let pack_ready = self.pack.try_lock().is_ok_and(|pack| pack.is_some());
+            let start_pack = !pack_ready && !bins.is_empty();
+            if pack_ready {
+                self.embed_packed(&ids, &bins, &mut output)?;
+            } else {
+                singles.extend(bins.into_iter().flatten());
+                singles.sort_unstable();
+            }
+            if !singles.is_empty() {
+                self.embed_singles(&ids, &singles, &mut output)?;
+            }
+            if start_pack {
+                self.start_pack_load();
+            }
+            output
+                .into_iter()
+                .map(|vector| vector.ok_or_else(|| "EmbeddingGemma 2 returned no vector".into()))
+                .collect()
+        }
+
+        fn embed_singles(
+            &self,
+            ids: &[Vec<u32>],
+            indices: &[usize],
+            output: &mut [Option<Vec<f32>>],
+        ) -> Result<(), String> {
+            let longest = indices
+                .iter()
+                .map(|&index| ids[index].len())
+                .max()
+                .unwrap_or(0);
             let bucket = BUCKETS
                 .iter()
                 .copied()
@@ -139,31 +178,89 @@ mod platform {
                 .ok_or_else(|| "EmbeddingGemma 2 input exceeds 512 tokens".to_string())?;
             let mut models = self.models.lock().unwrap_or_else(PoisonError::into_inner);
             if !models.contains_key(&bucket) {
-                models.insert(bucket, LoadedModel(self.load_function(bucket)?));
+                models.insert(
+                    bucket,
+                    LoadedModel(load_function(&self.compiled, &format!("embed_{bucket}"))?),
+                );
             }
-            ids.iter()
-                .map(|ids| {
-                    let (embeddings, mask) = self.inputs(ids, bucket)?;
-                    autoreleasepool(|_| unsafe {
-                        let embeddings = new_f16_array(&[1, bucket, HIDDEN], &embeddings)?;
-                        let mask = new_f16_array(&[1, bucket], &mask)?;
-                        let output = predict(&models[&bucket].0, &embeddings, &mask)?;
-                        let values = read_output(&output)?;
-                        if values.len() != DIMENSIONS {
-                            return Err(format!(
-                                "EmbeddingGemma 2 returned {} values, expected {DIMENSIONS}",
-                                values.len()
-                            ));
-                        }
-                        Ok(values)
-                    })
-                })
-                .collect()
+            for &index in indices {
+                let (embeddings, mask) = self.inputs(&ids[index], bucket)?;
+                output[index] = Some(autoreleasepool(|_| unsafe {
+                    let embeddings = new_f16_array(&[1, bucket, HIDDEN], &embeddings)?;
+                    let mask = new_f16_array(&[1, bucket], &mask)?;
+                    let result = predict(
+                        &models[&bucket].0,
+                        &[("inputs_embeds", &embeddings), ("attention_mask", &mask)],
+                    )?;
+                    read_embedding(&result, DIMENSIONS)
+                })?);
+            }
+            Ok(())
+        }
+
+        fn embed_packed(
+            &self,
+            ids: &[Vec<u32>],
+            bins: &[Vec<usize>],
+            output: &mut [Option<Vec<f32>>],
+        ) -> Result<(), String> {
+            let pack = self.pack.lock().unwrap_or_else(PoisonError::into_inner);
+            let model = &pack.as_ref().expect("packed model was loaded").0;
+            for bin in bins {
+                let mut combined = Vec::with_capacity(PACK_LENGTH);
+                let mut bias = vec![f16::from_f32(-10_000.0); PACK_LENGTH * PACK_LENGTH];
+                let mut positions = vec![f16::ZERO; PACK_LENGTH];
+                let mut pool = vec![f16::ZERO; PACK_SLOTS * PACK_LENGTH];
+                for (slot, &index) in bin.iter().enumerate() {
+                    let start = combined.len();
+                    combined.extend_from_slice(&ids[index]);
+                    let end = combined.len();
+                    let weight = f16::from_f32(1.0 / ids[index].len() as f32);
+                    for row in start..end {
+                        bias[row * PACK_LENGTH + start..row * PACK_LENGTH + end].fill(f16::ZERO);
+                        positions[row] = f16::from_f32((row - start) as f32);
+                        pool[slot * PACK_LENGTH + row] = weight;
+                    }
+                }
+                for row in combined.len()..PACK_LENGTH {
+                    bias[row * PACK_LENGTH + row] = f16::ZERO;
+                }
+                let embeddings = self.embeddings(&combined, PACK_LENGTH)?;
+                let values = autoreleasepool(|_| unsafe {
+                    let embeddings = new_f16_array(&[1, PACK_LENGTH, HIDDEN], &embeddings)?;
+                    let bias = new_f16_array(&[1, 1, PACK_LENGTH, PACK_LENGTH], &bias)?;
+                    let positions = new_f16_array(&[PACK_LENGTH, 1], &positions)?;
+                    let pool = new_f16_array(&[PACK_SLOTS, PACK_LENGTH], &pool)?;
+                    let result = predict(
+                        model,
+                        &[
+                            ("inputs_embeds", &embeddings),
+                            ("attention_bias", &bias),
+                            ("positions", &positions),
+                            ("pool", &pool),
+                        ],
+                    )?;
+                    read_embedding(&result, PACK_SLOTS * DIMENSIONS)
+                })?;
+                for (slot, &index) in bin.iter().enumerate() {
+                    output[index] =
+                        Some(values[slot * DIMENSIONS..(slot + 1) * DIMENSIONS].to_vec());
+                }
+            }
+            Ok(())
         }
 
         fn inputs(&self, ids: &[u32], bucket: usize) -> Result<(Vec<f16>, Vec<f16>), String> {
-            let mut embeddings = Vec::with_capacity(bucket * HIDDEN);
-            for index in 0..bucket {
+            let embeddings = self.embeddings(ids, bucket)?;
+            let mask = (0..bucket)
+                .map(|index| f16::from_f32(if index < ids.len() { 1.0 } else { 0.0 }))
+                .collect();
+            Ok((embeddings, mask))
+        }
+
+        fn embeddings(&self, ids: &[u32], length: usize) -> Result<Vec<f16>, String> {
+            let mut embeddings = Vec::with_capacity(length * HIDDEN);
+            for index in 0..length {
                 let id = ids.get(index).copied().unwrap_or(self.pad_id) as usize;
                 if id >= VOCABULARY {
                     return Err(format!("token id {id} is outside the vocabulary"));
@@ -174,26 +271,65 @@ mod platform {
                     embeddings.push(f16::from_f32(f32::from_bits(bits << 16) * self.scale));
                 }
             }
-            let mask = (0..bucket)
-                .map(|index| f16::from_f32(if index < ids.len() { 1.0 } else { 0.0 }))
-                .collect();
-            Ok((embeddings, mask))
+            Ok(embeddings)
         }
 
-        fn load_function(&self, bucket: usize) -> Result<Retained<MLModel>, String> {
-            autoreleasepool(|_| unsafe {
-                let configuration = MLModelConfiguration::new();
-                configuration.setComputeUnits(MLComputeUnits::All);
-                configuration
-                    .setFunctionName(Some(&NSString::from_str(&format!("embed_{bucket}"))));
-                let url =
-                    NSURL::fileURLWithPath(&NSString::from_str(&self.compiled.to_string_lossy()));
-                objc2::exception::catch(AssertUnwindSafe(|| {
-                    MLModel::modelWithContentsOfURL_configuration_error(&url, &configuration)
-                }))
-                .map_err(|_| format!("exception loading embed_{bucket}"))?
-                .map_err(|error| format!("loading embed_{bucket}: {}", nserr(&error)))
-            })
+        // Keep the first semantic request on the smaller single-text function while this loads.
+        fn start_pack_load(&self) {
+            if self.pack_started.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            let compiled = self.compiled.clone();
+            let pack = Arc::clone(&self.pack);
+            std::thread::spawn(move || match load_function(&compiled, "pack_256") {
+                Ok(model) => {
+                    *pack.lock().unwrap_or_else(PoisonError::into_inner) = Some(LoadedModel(model));
+                }
+                Err(error) => tracing::warn!(%error, "packed semantic model unavailable"),
+            });
+        }
+    }
+
+    fn load_function(compiled: &Path, name: &str) -> Result<Retained<MLModel>, String> {
+        autoreleasepool(|_| unsafe {
+            let configuration = MLModelConfiguration::new();
+            configuration.setComputeUnits(MLComputeUnits::All);
+            configuration.setFunctionName(Some(&NSString::from_str(name)));
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&compiled.to_string_lossy()));
+            objc2::exception::catch(AssertUnwindSafe(|| {
+                MLModel::modelWithContentsOfURL_configuration_error(&url, &configuration)
+            }))
+            .map_err(|_| format!("exception loading {name}"))?
+            .map_err(|error| format!("loading {name}: {}", nserr(&error)))
+        })
+    }
+
+    fn plan_packs(lengths: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
+        let mut bins = Vec::new();
+        let mut singles = Vec::new();
+        let mut current = Vec::new();
+        let mut used = 0;
+        for (index, &length) in lengths.iter().enumerate() {
+            if length > PACK_LENGTH {
+                singles.push(index);
+                continue;
+            }
+            if used + length > PACK_LENGTH || current.len() == PACK_SLOTS {
+                bins.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            current.push(index);
+            used += length;
+        }
+        if !current.is_empty() {
+            bins.push(current);
+        }
+        if bins.iter().all(|bin| bin.len() == 1) {
+            singles.extend(bins.into_iter().flatten());
+            singles.sort_unstable();
+            (Vec::new(), singles)
+        } else {
+            (bins, singles)
         }
     }
 
@@ -294,17 +430,16 @@ mod platform {
 
     unsafe fn predict(
         model: &MLModel,
-        embeddings: &Retained<MLMultiArray>,
-        mask: &Retained<MLMultiArray>,
+        features: &[(&str, &Retained<MLMultiArray>)],
     ) -> Result<Retained<MLMultiArray>, String> {
-        let keys = [
-            NSString::from_str("inputs_embeds"),
-            NSString::from_str("attention_mask"),
-        ];
-        let values = [
-            MLFeatureValue::featureValueWithMultiArray(embeddings),
-            MLFeatureValue::featureValueWithMultiArray(mask),
-        ];
+        let keys: Vec<Retained<NSString>> = features
+            .iter()
+            .map(|(name, _)| NSString::from_str(name))
+            .collect();
+        let values: Vec<Retained<MLFeatureValue>> = features
+            .iter()
+            .map(|(_, value)| MLFeatureValue::featureValueWithMultiArray(value))
+            .collect();
         let key_refs: Vec<&NSString> = keys.iter().map(|key| key.as_ref()).collect();
         let value_refs: Vec<&MLFeatureValue> = values.iter().map(|value| value.as_ref()).collect();
         let dictionary: Retained<NSDictionary<NSString, MLFeatureValue>> =
@@ -328,6 +463,17 @@ mod platform {
             .ok_or_else(|| "Core ML output has no embedding".to_string())?
             .multiArrayValue()
             .ok_or_else(|| "Core ML embedding is not a multi-array".to_string())
+    }
+
+    unsafe fn read_embedding(array: &MLMultiArray, expected: usize) -> Result<Vec<f32>, String> {
+        let values = read_output(array)?;
+        if values.len() != expected {
+            return Err(format!(
+                "EmbeddingGemma 2 returned {} values, expected {expected}",
+                values.len()
+            ));
+        }
+        Ok(values)
     }
 
     unsafe fn read_output(array: &MLMultiArray) -> Result<Vec<f32>, String> {
@@ -397,6 +543,21 @@ mod platform {
 
     fn nserr(error: &NSError) -> String {
         error.localizedDescription().to_string()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::plan_packs;
+
+        #[test]
+        fn packs_short_texts_and_keeps_long_texts_single() {
+            assert_eq!(
+                plan_packs(&[40, 40, 40, 40, 40, 40]),
+                (vec![vec![0, 1, 2, 3, 4, 5]], vec![])
+            );
+            assert_eq!(plan_packs(&[300, 100, 100]), (vec![vec![1, 2]], vec![0]));
+            assert_eq!(plan_packs(&[300, 100]), (vec![], vec![0, 1]));
+        }
     }
 }
 
