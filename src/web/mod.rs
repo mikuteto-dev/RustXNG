@@ -2,13 +2,14 @@
 //!
 //! Routes match upstream: `/`, `/search` (GET and POST, html/csv/json/rss),
 //! `/autocompleter`, `/config`, `/preferences`, `/stats`, `/stats/errors`,
-//! `/about`, `/opensearch.xml`, `/healthz`, `/robots.txt` and `/static/*`.
+//! `/mcp`, `/about`, `/opensearch.xml`, `/healthz`, `/robots.txt` and `/static/*`.
 
 pub mod favicons;
 pub mod feeds;
 pub mod handlers;
 pub mod image_proxy;
 pub mod limiter;
+pub mod mcp;
 pub mod preferences;
 
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use askama::Template;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::Serialize;
 
 use crate::aggregator::Searcher;
@@ -77,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .route("/favicon_proxy", get(favicons::handler))
         .route("/research", get(handlers::research))
         .route("/healthz", get(handlers::healthz))
+        .route("/mcp", post(mcp::handler))
         .route("/about", get(handlers::about))
         .route("/opensearch.xml", get(handlers::opensearch))
         .route("/robots.txt", get(handlers::robots))

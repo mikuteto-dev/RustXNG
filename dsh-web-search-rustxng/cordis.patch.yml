@@ -1,0 +1,7 @@
+- insert:
+    - id: web-search-rustxng
+      name: dsh-web-search-rustxng
+      config:
+        baseUrl: http://127.0.0.1:8888
+        maxResults: 5
+        semantic: false

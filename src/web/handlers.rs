@@ -51,6 +51,8 @@ pub struct SearchParams {
     pub exclude_domains: Option<String>,
     /// Agent-facing extension: fetch and return the page text of the top results.
     pub include_raw_content: Option<String>,
+    /// Re-rank with the in-process EmbeddingGemma 2 model.
+    pub semantic: Option<String>,
     /// Engine start strategy: "parallel" (default) or "staged".
     pub strategy: Option<String>,
 }
@@ -230,6 +232,11 @@ async fn run_search(
         exclude_domains: split_param(params.exclude_domains.as_deref()).unwrap_or_default(),
         include_raw_content: params
             .include_raw_content
+            .as_deref()
+            .map(|value| matches!(value, "1" | "true" | "on" | "yes"))
+            .unwrap_or(false),
+        semantic: params
+            .semantic
             .as_deref()
             .map(|value| matches!(value, "1" | "true" | "on" | "yes"))
             .unwrap_or(false),

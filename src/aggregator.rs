@@ -42,6 +42,8 @@ pub struct SearchRequest {
     pub exclude_domains: Vec<String>,
     /// Fetch the page text for the top results and return it as raw_content.
     pub include_raw_content: bool,
+    /// Re-rank results in-process with EmbeddingGemma 2.
+    pub semantic: bool,
     /// How the selected engines are started.
     pub strategy: crate::settings::SearchStrategy,
     /// Set once the site-scoped second pass already ran, so it cannot recurse.
@@ -68,6 +70,7 @@ impl SearchRequest {
             include_domains: Vec::new(),
             exclude_domains: Vec::new(),
             include_raw_content: false,
+            semantic: false,
             strategy: crate::settings::SearchStrategy::Parallel,
             site_retry_done: false,
             query,
@@ -142,6 +145,7 @@ pub struct Searcher {
     pub states: Arc<EngineStates>,
     pub metrics: Arc<Metrics>,
     pub plugins: Arc<PluginManager>,
+    semantic: Arc<tokio::sync::Mutex<Option<Arc<crate::semantic::EmbeddingGemma2>>>>,
     /// Our own BM25 index, when one is configured and opened.
     pub local_index: Option<Arc<crate::localindex::LocalIndex>>,
 }
@@ -191,6 +195,7 @@ impl Searcher {
             cache: Arc::new(cache),
             states: Arc::new(EngineStates::new()),
             metrics: Arc::new(Metrics::new()),
+            semantic: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -418,10 +423,14 @@ impl Searcher {
             );
         }
 
-        // Semantic re-ranking (embeddings) for merged multi-engine results.
-        // Matches neural rankers like Exa; single-engine keeps upstream order.
-        if request.engines.len() != 1 && !self.settings.search.embedding_url.is_empty() {
-            results = self.rerank_by_embedding(&request.query, results).await;
+        // Semantic re-ranking for merged multi-engine results. EmbeddingGemma 2
+        // is opt-in per request; the external endpoint remains configuration-driven.
+        if request.semantic
+            || (request.engines.len() != 1 && !self.settings.search.embedding_url.is_empty())
+        {
+            results = self
+                .rerank_by_embedding(&request.query, results, request.semantic)
+                .await;
         }
 
         // Site-scoped second pass: when the query names a known site but that
@@ -760,21 +769,43 @@ impl Searcher {
         &self,
         query: &Query,
         mut results: Vec<SearchResult>,
+        local: bool,
     ) -> Vec<SearchResult> {
         let settings = &self.settings.search;
         let topk = results.len().min(settings.embedding_topk);
         if topk < 2 {
             return results;
         }
-        let mut texts = vec![query.query_text()];
+        let mut texts = vec![if local {
+            format!("task: search result | query: {}", query.query_text())
+        } else {
+            query.query_text()
+        }];
         for result in &results[..topk] {
             let snippet: String = result.content.chars().take(240).collect();
-            texts.push(format!("{} {snippet}", result.title));
+            texts.push(if local {
+                format!("title: {} | text: {snippet}", result.title)
+            } else {
+                format!("{} {snippet}", result.title)
+            });
         }
-        let vectors = match self.embed(&texts).await {
-            Ok(vectors) if vectors.len() == texts.len() => vectors,
-            Ok(_) | Err(_) => {
-                tracing::warn!("embedding re-ranking skipped (bad response)");
+        let expected = texts.len();
+        let vectors = match if local {
+            self.embed_local(texts).await
+        } else {
+            self.embed(&texts).await
+        } {
+            Ok(vectors) if vectors.len() == expected => vectors,
+            Ok(vectors) => {
+                tracing::warn!(
+                    expected,
+                    actual = vectors.len(),
+                    "embedding re-ranking skipped"
+                );
+                return results;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "embedding re-ranking skipped");
                 return results;
             }
         };
@@ -789,6 +820,23 @@ impl Searcher {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results
+    }
+
+    async fn embed_local(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        let model = {
+            let mut slot = self.semantic.lock().await;
+            if slot.is_none() {
+                tracing::info!("loading EmbeddingGemma 2 (first use downloads about 550 MB)");
+                let model = tokio::task::spawn_blocking(crate::semantic::EmbeddingGemma2::load)
+                    .await
+                    .map_err(|error| error.to_string())??;
+                *slot = Some(Arc::new(model));
+            }
+            slot.as_ref().expect("semantic model was loaded").clone()
+        };
+        tokio::task::spawn_blocking(move || model.embed(&texts))
+            .await
+            .map_err(|error| error.to_string())?
     }
 
     /// Ask the embeddings endpoint for one vector per input text.
@@ -1088,6 +1136,7 @@ mod orchestration_tests {
             cache: Arc::new(Cache::default()),
             states: Arc::new(EngineStates::new()),
             metrics: Arc::new(Metrics::new()),
+            semantic: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 

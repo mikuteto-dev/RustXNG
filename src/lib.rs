@@ -41,6 +41,7 @@ pub mod plugins;
 pub mod quality;
 pub mod query;
 pub mod results;
+pub mod semantic;
 pub mod settings;
 pub mod version;
 pub mod web;

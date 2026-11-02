@@ -78,6 +78,61 @@ async fn get_uri(app: &Router, uri: &str) -> (StatusCode, String, axum::http::He
     (status, body, headers)
 }
 
+async fn mcp_request(app: &Router, payload: serde_json::Value) -> serde_json::Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    serde_json::from_str(&body_text(response).await).unwrap()
+}
+
+#[tokio::test]
+async fn mcp_exposes_search_and_returns_sources() {
+    let base_url = start_fake_engine().await;
+    let app = app(settings_for(&base_url));
+
+    let initialized = mcp_request(
+        &app,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05" }
+        }),
+    )
+    .await;
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "rustxng");
+
+    let listed = mcp_request(
+        &app,
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(listed["result"]["tools"][0]["name"], "web_search");
+
+    let result = mcp_request(
+        &app,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "web_search", "arguments": { "query": "rust", "max_results": 1 } }
+        }),
+    )
+    .await;
+    let sources: serde_json::Value =
+        serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(sources[0]["url"], "https://example.com/rust");
+}
+
 #[tokio::test]
 async fn json_search_returns_merged_results() {
     let base_url = start_fake_engine().await;

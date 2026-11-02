@@ -35,6 +35,7 @@ Google・Bing・Wikipedia・GitHub など **200 以上の検索サイトをま�
 - **まとめ検索** — 一般・ニュース・画像・動画・音楽・書籍・論文・パッケージ・地図など、200 以上のサイトを横断
 - **結果の統合** — 重複を除き、関連度順に並べ替え、落ちているサイトがあっても残りで結果を返す
 - **いろいろな出力** — ブラウザ用の画面のほか、JSON / CSV / RSS でも取得できる
+- **MCP** — `/mcp` で検索ツールを提供。HTTP API と同じプロセスで動く
 - **プライバシー** — 画像や favicon はプロキシ経由で表示し、利用者の IP を相手サイトに見せない
 - **運用向けの機能** — 検索候補、設定画面、統計画面、ヘルスチェック、メトリクス出力、Valkey / Redis 共有キャッシュ、bot 対策のレート制限
 - **自分のデータも検索** — PostgreSQL / MySQL / MariaDB / MongoDB / SQLite / Valkey / Elasticsearch / Solr / Meilisearch を検索対象にできる
@@ -146,6 +147,7 @@ LLM のツール呼び出しでは、返す件数と本文の有無を指定で�
 | `include_domains=github.com` | このドメインとサブドメインだけに絞る | — |
 | `exclude_domains=example.com` | このドメインを除外する | — |
 | `include_raw_content=1` | 上位 5 件のページ本文を `raw_content` に入れる | +16 KB / +3.5 秒 |
+| `semantic=1` | macOS 15 以降で EmbeddingGemma 2 により再順位付けする | 初回のみ約 550 MB を取得 |
 | `strategy=staged` | 少数のエンジンから順に開始し、十分な結果で打ち切る（既定は parallel） | 3.0 秒 → **0.84 秒**（結果 123 → 55 件） |
 
 **推奨の使い方（商用 API と比べて）**: 既定の `settings.toml` は測定済みです。
@@ -164,6 +166,10 @@ curl 'http://127.0.0.1:8888/search?q=<query>&format=json&max_results=5&include_r
 ```
 
 `include_raw_content=1` で本文を付け、ページはキャッシュされるので 2 回目以降は即返しです。詳細は [docs/BENCHMARK.md](docs/BENCHMARK.md)。
+
+### MCP
+
+同じ RustXNG プロセスが `http://127.0.0.1:8888/mcp` で `web_search` ツールを提供します。`semantic` オプションを指定したときだけ Core ML モデルを読み込みます。
 
 ### ディープリサーチ
 

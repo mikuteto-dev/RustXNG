@@ -22,6 +22,7 @@ An agent searches, reads, and decides — then does it again. What it needs unde
 | Text to ground on | **~32,000 characters** from the top 5 pages in one request |
 | Survive one dead source | 180 engines in parallel, per-engine suspension and rest |
 | Safe with untrusted URLs | Public addresses only (**SSRF guard**) |
+| One local process | HTTP search and MCP share the same server |
 
 ## Install
 
@@ -82,7 +83,12 @@ curl "http://127.0.0.1:8888/search?q=tokio+runtime&format=json"
 
 # search + page text for grounding
 curl "http://127.0.0.1:8888/search?q=tokio+runtime&format=json&include_raw_content=1"
+
+# optional semantic re-ranking on macOS 15+ (first use downloads about 550 MB)
+curl "http://127.0.0.1:8888/search?q=tokio+runtime&format=json&semantic=1"
 ```
+
+The same process exposes a stateless MCP endpoint at `http://127.0.0.1:8888/mcp` with a `web_search` tool. Semantic re-ranking uses EmbeddingGemma 2 through Core ML and loads only when `semantic=1` is requested.
 
 Response shape (SearXNG compatible):
 
